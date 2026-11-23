@@ -1,5 +1,8 @@
 package com.unicornemulator.app
 
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color as AndroidColor
@@ -15,6 +18,8 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -324,6 +329,50 @@ private fun logSaveFiles(context: Context, reason: String) {
     Log.d("Unicorn", "SRAM check [$reason]: dir=${savesDir.absolutePath}, files=$files")
 }
 
+private fun snapshotFileForRom(context: Context, romFile: File): File {
+    val snapshotsDir = File(context.filesDir, "snapshots").apply { mkdirs() }
+    return File(snapshotsDir, "${romFile.nameWithoutExtension}.state")
+}
+
+private fun saveSnapshotToDisk(context: Context, view: GLRetroView, romFile: File): Boolean {
+    return try {
+        val stateBytes = view.serializeState()
+        if (stateBytes.isEmpty()) {
+            Log.d("Unicorn", "serializeState returned empty bytes for ${romFile.name}")
+            return false
+        }
+        val snapshotFile = snapshotFileForRom(context, romFile)
+        val tempFile = File(snapshotFile.parentFile, "${snapshotFile.name}.tmp")
+        tempFile.writeBytes(stateBytes)
+        if (!tempFile.renameTo(snapshotFile)) {
+            snapshotFile.writeBytes(stateBytes)
+            tempFile.delete()
+        }
+        Log.d("Unicorn", "Saved snapshot to ${snapshotFile.absolutePath} (${stateBytes.size} bytes)")
+        true
+    } catch (e: Exception) {
+        Log.e("Unicorn", "Failed to save snapshot for ${romFile.name}", e)
+        false
+    }
+}
+
+private fun loadSnapshotFromDisk(context: Context, view: GLRetroView, romFile: File): Boolean {
+    return try {
+        val snapshotFile = snapshotFileForRom(context, romFile)
+        if (!snapshotFile.exists() || snapshotFile.length() == 0L) {
+            Log.d("Unicorn", "No snapshot file found at ${snapshotFile.absolutePath}")
+            return false
+        }
+        val bytes = snapshotFile.readBytes()
+        val applied = view.unserializeState(bytes)
+        Log.d("Unicorn", "Loaded snapshot from ${snapshotFile.absolutePath} (${bytes.size} bytes, applied=$applied)")
+        applied
+    } catch (e: Exception) {
+        Log.e("Unicorn", "Failed to load snapshot for ${romFile.name}", e)
+        false
+    }
+}
+
 private val tornDownRetroViews: MutableSet<GLRetroView> =
     Collections.newSetFromMap(WeakHashMap())
 
@@ -389,10 +438,11 @@ fun EmulatorScreen(
     var romPath by remember { mutableStateOf<String?>(null) }
     var libraryRoms by remember { mutableStateOf<List<File>>(emptyList()) }
     var statusMessage by remember { mutableStateOf("No GB / GBC ROM loaded yet") }
-    val retroViewHolder = remember { arrayOfNulls<GLRetroView>(1) }
+    var activeRetroView by remember { mutableStateOf<GLRetroView?>(null) }
     var showEjectDialog by remember { mutableStateOf(false) }
     var showPurgeDialog by remember { mutableStateOf(false) }
-
+    var showRestoreSnapshotDialog by remember { mutableStateOf(false) }
+    var snapshotFeedback by remember { mutableStateOf<String?>(null) }
     val isBlackMode = themeMode == UnicornThemeMode.BLACK
     val cardColor = when (themeMode) {
         UnicornThemeMode.LIGHT -> Color(0xFFD9D6E6)
@@ -426,13 +476,29 @@ fun EmulatorScreen(
     }
 
     LaunchedEffect(Unit) {
-        libraryRoms = getLibraryRoms(context)
-        logSaveFiles(context, "startup")
+        libraryRoms = withContext(Dispatchers.IO) {
+            getLibraryRoms(context)
+        }
+        withContext(Dispatchers.IO) {
+            logSaveFiles(context, "startup")
+        }
     }
+    LaunchedEffect(snapshotFeedback) {
+        val currentMessage = snapshotFeedback ?: return@LaunchedEffect
+        delay(2000L)
+        if (snapshotFeedback == currentMessage) {
+            snapshotFeedback = null
+        }
+    }
+    val feedbackAlpha by animateFloatAsState(
+        targetValue = if (snapshotFeedback != null) 0.75f else 0f,
+        animationSpec = tween(durationMillis = 400),
+        label = "snapshotFeedbackAlpha"
+    )
 
     DisposableEffect(lifecycleOwner, romPath) {
         val observer = LifecycleEventObserver { _, event ->
-            val currentView = retroViewHolder[0] ?: return@LifecycleEventObserver
+            val currentView = activeRetroView ?: return@LifecycleEventObserver
             val activeRomFile = romPath?.let { File(it) }
             when (event) {
                 Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> {
@@ -482,8 +548,8 @@ fun EmulatorScreen(
 
             if (copiedRom != null && copiedRom.exists() && copiedRom.length() > 0 && copiedRom.canRead()) {
                 val previousRomFile = romPath?.let { File(it) }
-                teardownRetroView(context, retroViewHolder[0], lifecycleOwner, previousRomFile, "load new ROM")
-                retroViewHolder[0] = null
+                teardownRetroView(context, activeRetroView, lifecycleOwner, previousRomFile, "load new ROM")
+                activeRetroView = null
                 copiedRom.setLastModified(System.currentTimeMillis())
                 libraryRoms = getLibraryRoms(context)
                 Log.d("Unicorn", "ROM added to library: ${copiedRom.absolutePath} (${copiedRom.length()} bytes)")
@@ -525,8 +591,8 @@ fun EmulatorScreen(
                     onClick = {
                         showEjectDialog = false
                         val activeRomFile = romPath?.let { File(it) }
-                        val viewToTeardown = retroViewHolder[0]
-                        retroViewHolder[0] = null
+                        val viewToTeardown = activeRetroView
+                        activeRetroView = null
                         romPath = null
                         teardownRetroView(context, viewToTeardown, lifecycleOwner, activeRomFile, "eject ROM")
                         libraryRoms = getLibraryRoms(context)
@@ -581,8 +647,8 @@ fun EmulatorScreen(
                     onClick = {
                         showPurgeDialog = false
                         val activeRomFile = romPath?.let { File(it) }
-                        val viewToTeardown = retroViewHolder[0]
-                        retroViewHolder[0] = null
+                        val viewToTeardown = activeRetroView
+                        activeRetroView = null
                         romPath = null
                         teardownRetroView(context, viewToTeardown, lifecycleOwner, activeRomFile, "purge ROMs")
                         val removed = purgeLibraryRoms(context)
@@ -600,6 +666,61 @@ fun EmulatorScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showPurgeDialog = false }) {
+                    Text(
+                        text = "Cancel",
+                        color = dialogTextColor
+                    )
+                }
+            }
+        )
+    }
+
+    if (showRestoreSnapshotDialog) {
+        val activeRomFile = romPath?.let { File(it) }
+        val activeView = activeRetroView
+
+        AlertDialog(
+            onDismissRequest = { showRestoreSnapshotDialog = false },
+            containerColor = dialogContainerColor,
+            titleContentColor = dialogTextColor,
+            textContentColor = dialogSecondaryTextColor,
+            modifier = if (isBlackMode) {
+                Modifier.border(1.dp, Color(0xFF242430), RoundedCornerShape(28.dp))
+            } else {
+                Modifier
+            },
+            title = {
+                Text(
+                    text = "Go Back to Snapshot?",
+                    color = dialogTextColor,
+                    fontWeight = FontWeight.Bold
+                )
+            },
+            text = {
+                Text(
+                    text = "Restore the saved snapshot for ${activeRomFile?.nameWithoutExtension ?: "this game"}? Current progress since then will be replaced.",
+                    color = dialogSecondaryTextColor
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showRestoreSnapshotDialog = false
+                        if (activeRomFile != null && activeView != null) {
+                            val restored = loadSnapshotFromDisk(context, activeView, activeRomFile)
+                            snapshotFeedback = if (restored) "Restored snapshot" else "Could not restore snapshot"
+                        }
+                    }
+                ) {
+                    Text(
+                        text = "Go Back",
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showRestoreSnapshotDialog = false }) {
                     Text(
                         text = "Cancel",
                         color = dialogTextColor
@@ -651,13 +772,13 @@ fun EmulatorScreen(
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(14.dp))
 
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f),
-            contentAlignment = Alignment.TopCenter
+            contentAlignment = Alignment.BottomCenter
         ) {
             val currentPath = romPath
             if (currentPath != null) {
@@ -687,20 +808,20 @@ fun EmulatorScreen(
                                 isFocusable = true
                                 isFocusableInTouchMode = true
                                 onCreate(lifecycleOwner)
-                                retroViewHolder[0] = this
+                                activeRetroView = this
                                 postDelayed({
-                                    if (retroViewHolder[0] === this) {
+                                    if (activeRetroView === this) {
                                         loadSramFromDisk(ctx, this, romFile)
                                     }
                                 }, 250L)
                             }
                         },
                         update = { view ->
-                            retroViewHolder[0] = view
+                            activeRetroView = view
                         },
                         onRelease = { view ->
-                            if (retroViewHolder[0] === view) {
-                                retroViewHolder[0] = null
+                            if (activeRetroView === view) {
+                                activeRetroView = null
                             }
                             teardownRetroView(context, view, lifecycleOwner, File(currentPath), "AndroidView onRelease")
                         },
@@ -775,7 +896,7 @@ fun EmulatorScreen(
                                             romFile.setLastModified(System.currentTimeMillis())
                                             libraryRoms = getLibraryRoms(context)
                                             statusMessage = ""
-                                            retroViewHolder[0] = null
+                                            activeRetroView = null
                                             romPath = romFile.absolutePath
                                             Log.d("Unicorn", "Launched ROM from library: ${romFile.absolutePath}")
                                         }
@@ -814,10 +935,77 @@ fun EmulatorScreen(
 
         Spacer(modifier = Modifier.height(14.dp))
 
+        val snapshotRomPath = romPath
+        val snapshotView = activeRetroView
+        if (snapshotRomPath != null && snapshotView != null) {
+            val snapshotRomFile = File(snapshotRomPath)
+            val snapshotFile = snapshotFileForRom(context, snapshotRomFile)
+            val hasSnapshot = snapshotFile.exists() && snapshotFile.length() > 0L
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        val saved = saveSnapshotToDisk(context, snapshotView, snapshotRomFile)
+                        snapshotFeedback = if (saved) "Snapshot saved" else "Snapshot failed"
+                    },
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.onBackground
+                    ),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = "Save Now",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = {
+                        if (hasSnapshot) {
+                            showRestoreSnapshotDialog = true
+                        } else {
+                            snapshotFeedback = "No snapshot saved yet"
+                        }
+                    },
+                    enabled = hasSnapshot,
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.onBackground
+                    ),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text(
+                        text = "Go Back to Save",
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            snapshotFeedback?.let { msg ->
+                Text(
+                    text = snapshotFeedback ?: "",
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.75f),
+                    fontSize = 11.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier
+                        .height(18.dp)
+                        .padding(top = 2.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+        }
+
         GameBoySpControls(
             themeMode = themeMode,
             onKeyEvent = { action, keyCode ->
-                val view = retroViewHolder[0]
+                val view = activeRetroView
                 if (view != null) {
                     dispatchRetroKey(view, action, keyCode)
                 } else {
