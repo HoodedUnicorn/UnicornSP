@@ -283,6 +283,41 @@ private fun purgeLibraryRoms(context: Context): Int {
     return deletedCount
 }
 
+private fun sramFileForRom(context: Context, romFile: File): File {
+    val savesDir = File(context.filesDir, "saves").apply { mkdirs() }
+    return File(savesDir, "${romFile.nameWithoutExtension}.srm")
+}
+
+private fun saveSramToDisk(context: Context, view: GLRetroView, romFile: File) {
+    try {
+        val sramBytes = view.serializeSRAM()
+        if (sramBytes.isEmpty()) {
+            Log.d("Unicorn", "serializeSRAM returned empty bytes for ${romFile.name}")
+            return
+        }
+        val saveFile = sramFileForRom(context, romFile)
+        saveFile.writeBytes(sramBytes)
+        Log.d("Unicorn", "Saved SRAM to ${saveFile.absolutePath} (${sramBytes.size} bytes)")
+    } catch (e: Exception) {
+        Log.e("Unicorn", "Failed to save SRAM for ${romFile.name}", e)
+    }
+}
+
+private fun loadSramFromDisk(context: Context, view: GLRetroView, romFile: File) {
+    try {
+        val saveFile = sramFileForRom(context, romFile)
+        if (saveFile.exists() && saveFile.length() > 0) {
+            val bytes = saveFile.readBytes()
+            val applied = view.unserializeSRAM(bytes)
+            Log.d("Unicorn", "Loaded SRAM from ${saveFile.absolutePath} (${bytes.size} bytes, applied=$applied)")
+        } else {
+            Log.d("Unicorn", "No existing SRAM file at ${saveFile.absolutePath}")
+        }
+    } catch (e: Exception) {
+        Log.e("Unicorn", "Failed to load SRAM for ${romFile.name}", e)
+    }
+}
+
 private fun logSaveFiles(context: Context, reason: String) {
     val savesDir = File(context.filesDir, "saves")
     val files = savesDir.listFiles()?.joinToString { "${it.name} (${it.length()}B)" } ?: "none"
@@ -296,6 +331,7 @@ private fun teardownRetroView(
     context: Context,
     view: GLRetroView?,
     lifecycleOwner: LifecycleOwner,
+    romFile: File?,
     reason: String
 ) {
     if (view == null) return
@@ -306,7 +342,11 @@ private fun teardownRetroView(
         }
     }
 
+    if (romFile != null) {
+        saveSramToDisk(context, view, romFile)
+    }
     logSaveFiles(context, "before destroy ($reason)")
+
     try {
         lifecycleOwner.lifecycle.removeObserver(view)
     } catch (e: Exception) {
@@ -390,12 +430,16 @@ fun EmulatorScreen(
         logSaveFiles(context, "startup")
     }
 
-    DisposableEffect(lifecycleOwner) {
+    DisposableEffect(lifecycleOwner, romPath) {
         val observer = LifecycleEventObserver { _, event ->
             val currentView = retroViewHolder[0] ?: return@LifecycleEventObserver
+            val activeRomFile = romPath?.let { File(it) }
             when (event) {
                 Lifecycle.Event.ON_PAUSE, Lifecycle.Event.ON_STOP -> {
                     try {
+                        if (activeRomFile != null) {
+                            saveSramToDisk(context, currentView, activeRomFile)
+                        }
                         currentView.onPause()
                         logSaveFiles(context, "lifecycle $event")
                     } catch (e: Exception) {
@@ -437,7 +481,8 @@ fun EmulatorScreen(
             val copiedRom = copyUriToLibrary(context, pickedUri, targetFileName)
 
             if (copiedRom != null && copiedRom.exists() && copiedRom.length() > 0 && copiedRom.canRead()) {
-                teardownRetroView(context, retroViewHolder[0], lifecycleOwner, "load new ROM")
+                val previousRomFile = romPath?.let { File(it) }
+                teardownRetroView(context, retroViewHolder[0], lifecycleOwner, previousRomFile, "load new ROM")
                 retroViewHolder[0] = null
                 copiedRom.setLastModified(System.currentTimeMillis())
                 libraryRoms = getLibraryRoms(context)
@@ -479,10 +524,11 @@ fun EmulatorScreen(
                 TextButton(
                     onClick = {
                         showEjectDialog = false
+                        val activeRomFile = romPath?.let { File(it) }
                         val viewToTeardown = retroViewHolder[0]
                         retroViewHolder[0] = null
                         romPath = null
-                        teardownRetroView(context, viewToTeardown, lifecycleOwner, "eject ROM")
+                        teardownRetroView(context, viewToTeardown, lifecycleOwner, activeRomFile, "eject ROM")
                         libraryRoms = getLibraryRoms(context)
                         statusMessage = "No GB / GBC ROM loaded yet"
                         Log.d("Unicorn", "ROM ejected by user (SRAM saves preserved)")
@@ -534,10 +580,11 @@ fun EmulatorScreen(
                 TextButton(
                     onClick = {
                         showPurgeDialog = false
+                        val activeRomFile = romPath?.let { File(it) }
                         val viewToTeardown = retroViewHolder[0]
                         retroViewHolder[0] = null
                         romPath = null
-                        teardownRetroView(context, viewToTeardown, lifecycleOwner, "purge ROMs")
+                        teardownRetroView(context, viewToTeardown, lifecycleOwner, activeRomFile, "purge ROMs")
                         val removed = purgeLibraryRoms(context)
                         libraryRoms = getLibraryRoms(context)
                         statusMessage = "No GB / GBC ROM loaded yet"
@@ -641,6 +688,11 @@ fun EmulatorScreen(
                                 isFocusableInTouchMode = true
                                 onCreate(lifecycleOwner)
                                 retroViewHolder[0] = this
+                                postDelayed({
+                                    if (retroViewHolder[0] === this) {
+                                        loadSramFromDisk(ctx, this, romFile)
+                                    }
+                                }, 250L)
                             }
                         },
                         update = { view ->
@@ -650,7 +702,7 @@ fun EmulatorScreen(
                             if (retroViewHolder[0] === view) {
                                 retroViewHolder[0] = null
                             }
-                            teardownRetroView(context, view, lifecycleOwner, "AndroidView onRelease")
+                            teardownRetroView(context, view, lifecycleOwner, File(currentPath), "AndroidView onRelease")
                         },
                         modifier = Modifier
                             .fillMaxWidth()
